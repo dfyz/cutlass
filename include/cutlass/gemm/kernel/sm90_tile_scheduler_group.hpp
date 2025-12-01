@@ -42,6 +42,9 @@ namespace cutlass::gemm::kernel::detail {
 
 ///////////////////////////////////////////////////////////////////////////////
 
+template <class GroupProblemShape, int SchedulerPipelineStageCount>
+class PersistentTileSchedulerSm90GroupWithCounters;
+
 // Persistent Thread Block (TB) scheduler
 template <class GroupProblemShape, int SchedulerPipelineStageCount>
 class PersistentTileSchedulerSm90Group {
@@ -60,6 +63,8 @@ private:
     uint64_t total_tiles = 0;
     uint64_t problem_blocks_along_raster_order = 0;
   } current_group_info_;
+
+  friend class PersistentTileSchedulerSm90GroupWithCounters<GroupProblemShape, SchedulerPipelineStageCount>;
 
 public:
   struct WorkTileInfo {
