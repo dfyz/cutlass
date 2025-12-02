@@ -73,15 +73,12 @@ public:
   template <class ClusterShape>
   CUTLASS_DEVICE
   auto
-  initial_work_tile_info(ClusterShape) {
-    // CUSTOM LOGIC STARTS
+  initial_work_tile_info(ClusterShape cluster_shape) {
     if (threadIdx.x == 0) {
       wait_on_group_counter(0);
     }
     __syncthreads();
-    // CUSTOM LOGIC ENDS
-
-    return Base::get_current_work_for_linear_idx(Base::current_work_linear_idx_);
+    return Base::initial_work_tile_info(cluster_shape);
   }
 };
 
