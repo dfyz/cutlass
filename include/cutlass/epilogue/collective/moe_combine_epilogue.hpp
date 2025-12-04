@@ -1,5 +1,13 @@
 #pragma once
 
+#include <cuda_runtime_api.h> // cudaStream_t
+#include <cute/tensor.hpp> // cute::Tensor
+#include <cute/util/type_traits.hpp> // cute::remove_poiinter_t
+#include <cutlass/cuda_host_adapter.hpp> // CudaHostAdapter
+#include <cutlass/detail/layout.hpp> // TagToStride*
+#include <cutlass/epilogue/dispatch_policy.hpp> // PtrArrayNoSmemWarpSpecialized
+#include <cutlass/epilogue/thread/linear_combination.h> // LinearCombination
+
 namespace cutlass::epilogue::collective {
 
 template <
