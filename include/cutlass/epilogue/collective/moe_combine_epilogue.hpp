@@ -20,7 +20,8 @@ public:
   using CDStride = cutlass::gemm::TagToStrideC_t<CDLayout>*;
   using InternalCDStride = cute::remove_pointer_t<CDStride>;
 
-  using DispatchPolicy = cutlass::epilogue::PtrArrayNoSmemWarpSpecialized;
+  using EpilogueSchedule = cutlass::epilogue::PtrArrayNoSmemWarpSpecialized;
+  using DispatchPolicy = EpilogueSchedule;
 
   using ElementC = CDType;
   using ElementD = CDType;
@@ -31,6 +32,10 @@ public:
   using InternalStrideC = InternalCDStride;
   using InternalStrideD = InternalCDStride;
 
+  struct SharedStorage {};
+
+  // This is the trivial epilogue op that does nothing,
+  // and is not actually used (only needed for backward compatibility).
   using ThreadEpilogueOp = cutlass::epilogue::thread::LinearCombination<
     CDType,
     1, // one element per operation
@@ -38,12 +43,13 @@ public:
     AccumType // linear combination compute type
   >;
 
-  struct SharedStorage {};
-
   struct Arguments {
+    // These fields are only preserved for backward compatibility.
     typename ThreadEpilogueOp::Params thread{};
     const CDType** ptr_C = nullptr;
     CDStride dC{};
+
+    // These fields are actually used.
     CDType** ptr_D = nullptr;
     CDStride dD{};
   };
@@ -97,7 +103,46 @@ public:
       int thread_idx,
       char*
   ) {
-    // TODO
+    auto M = cute::get<0>(problem_shape_mnkl);
+    auto N = cute::get<1>(problem_shape_mnkl);
+    auto m_coord = cute::get<0>(blk_coord_mnkl);
+    auto n_coord = cute::get<1>(blk_coord_mnkl);
+    auto l_coord = cute::get<3>(blk_coord_mnkl);
+
+    auto stride_d = detail::get_epilogue_stride<EpilogueSchedule>(params.dD[l_coord]);
+
+    cute::Tensor mD_mnl = cute::make_tensor(
+      cute::make_gmem_ptr(params.ptr_D[l_coord]),
+      cute::make_shape(M, N, 1),
+      stride_d
+    );
+
+    cute::Tensor gD_mnl = cute::local_tile(
+      mD_mnl,
+      blk_shape_MNK,
+      cute::make_coord(cute::_, cute::_, cute::_),
+      cute::Step<cute::_1, cute::_1, cute::X>{}
+    );
+
+    cute::Tensor gD = gD_mnl(cute::_, cute::_, m_coord, n_coord, 0);
+    auto thr_mma = tiled_mma.get_thread_slice(thread_idx);
+    cute::Tensor tCgD = thr_mma.partition_C(gD);
+
+    auto mn = cute::make_shape(M, N);
+    cute::Tensor mD_crd = cute::make_identity_tensor(mn);
+    cute::Tensor cD_mn = cute::local_tile(
+      mD_crd,
+      cute::take<0, 2>(blk_shape_MNK),
+      cute::make_coord(m_coord, n_coord)
+    );
+    cute::Tensor tCcD = thr_mma.partition_C(cD_mn);
+
+    CUTLASS_PRAGMA_UNROLL
+    for (int i = 0; i < cute::size(accumulators); ++i) {
+      if (cute::elem_less(tCcD(i), mn)) {
+        tCgD(i) = static_cast<CDType>(accumulators(i));
+      }
+    }
   }
 
 private:
