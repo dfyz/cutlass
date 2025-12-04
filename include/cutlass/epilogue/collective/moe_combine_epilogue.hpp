@@ -109,38 +109,24 @@ public:
     auto n_coord = cute::get<1>(blk_coord_mnkl);
     auto l_coord = cute::get<3>(blk_coord_mnkl);
 
-    auto stride_d = detail::get_epilogue_stride<EpilogueSchedule>(params.dD[l_coord]);
-
-    cute::Tensor mD_mnl = cute::make_tensor(
-      cute::make_gmem_ptr(params.ptr_D[l_coord]),
-      cute::make_shape(M, N, 1),
-      stride_d
-    );
-
-    cute::Tensor gD_mnl = cute::local_tile(
-      mD_mnl,
-      blk_shape_MNK,
-      cute::make_coord(cute::_, cute::_, cute::_),
-      cute::Step<cute::_1, cute::_1, cute::X>{}
-    );
-
-    cute::Tensor gD = gD_mnl(cute::_, cute::_, m_coord, n_coord, 0);
     auto thr_mma = tiled_mma.get_thread_slice(thread_idx);
-    cute::Tensor tCgD = thr_mma.partition_C(gD);
-
     auto mn = cute::make_shape(M, N);
-    cute::Tensor mD_crd = cute::make_identity_tensor(mn);
-    cute::Tensor cD_mn = cute::local_tile(
-      mD_crd,
+    cute::Tensor global_coords = cute::make_identity_tensor(mn);
+    cute::Tensor tile_coords = cute::local_tile(
+      global_coords,
       cute::take<0, 2>(blk_shape_MNK),
       cute::make_coord(m_coord, n_coord)
     );
-    cute::Tensor tCcD = thr_mma.partition_C(cD_mn);
+    cute::Tensor thread_coords = thr_mma.partition_C(tile_coords);
 
     CUTLASS_PRAGMA_UNROLL
     for (int i = 0; i < cute::size(accumulators); ++i) {
-      if (cute::elem_less(tCcD(i), mn)) {
-        tCgD(i) = static_cast<CDType>(accumulators(i));
+      auto out_coord = thread_coords(i);
+      auto [row, col] = out_coord;
+      if (cute::elem_less(out_coord, mn)) {
+        // Assume contiguous row-major layout.
+        auto out_ptr = params.ptr_D[l_coord] + (row * N) + col;
+        *out_ptr = static_cast<CDType>(accumulators(i));
       }
     }
   }
