@@ -117,28 +117,51 @@ public:
     );
     const cute::Tensor thread_coords = thr_mma.partition_C(tile_coords);
 
+    const uint64_t cur_out_off = params.out_offs[l_coord];
+    const int thread_rows = cute::size<1>(cute::layout<0>(accumulators));
+    const int thread_cols = cute::size<2>(cute::layout<0>(accumulators));
     CUTLASS_PRAGMA_UNROLL
-    for (int i = 0; i < cute::size(accumulators); ++i) {
-      const auto out_coord = thread_coords(i);
-      if (cute::elem_less(out_coord, mn)) {
-        const auto [row, col] = out_coord;
-        const uint64_t local_token_idx = params.out_offs[l_coord] + row;
-        const uint8_t peer = params.token_owner[local_token_idx];
-        const float score = params.local_token_scores[local_token_idx];
+    for (int row = 0; row < thread_rows; ++row) {
+      const uint64_t local_token_idx = cur_out_off + cute::get<0>(thread_coords(
+        cute::make_coord(0, row, 0),
+        0,
+        0
+      ));
+      const uint8_t peer = params.token_owner[local_token_idx];
+      const float score = params.local_token_scores[local_token_idx];
 
-        __nv_bfloat16* peer_output = params.routed_outputs_ptrs[peer];
-        // Assume contiguous row-major layout.
-        __nv_bfloat16* out_ptr =
-          peer_output +
-          params.local_token_to_remote_token_idx[local_token_idx] * params.dim +
-          col;
-        // This is wrong:
-        //   * uses the GPU scope instead of the system one
-        //   * uses a CAS instead of an actual atomic op
-        atomicAdd(
-          out_ptr,
-          __float2bfloat16(score * accumulators(i))
+      __nv_bfloat16* peer_output = params.routed_outputs_ptrs[peer];
+      const uint64_t remote_token_idx = params.local_token_to_remote_token_idx[local_token_idx];
+      // Assume contiguous row-major layout.
+      __nv_bfloat16* out_ptr = peer_output + remote_token_idx * params.dim;
+
+      CUTLASS_PRAGMA_UNROLL
+      for (int col = 0; col < thread_cols; ++col) {
+        const auto pair_start = thread_coords(
+          cute::make_coord(0, row, col),
+          0,
+          0
         );
+        if (cute::elem_less(pair_start, mn)) {
+          __nv_bfloat162 val {
+            __float2bfloat16(score * accumulators(
+              cute::make_coord(0, row, col),
+              0,
+              0
+            )),
+            __float2bfloat16(score * accumulators(
+              cute::make_coord(1, row, col),
+              0,
+              0
+            )),
+          };
+          asm(
+            "red.relaxed.sys.add.noftz.bf16x2 [%0], %1;"
+            :
+            : "l"(out_ptr + cute::get<1>(pair_start)), "r"(*reinterpret_cast<unsigned*>(&val))
+            : "memory"
+          );
+        }
       }
     }
   }
