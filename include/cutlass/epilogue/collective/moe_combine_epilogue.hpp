@@ -43,7 +43,6 @@ public:
     uint64_t* out_offs;
     uint8_t* token_owner;
     uint64_t* local_token_to_remote_token_idx;
-    float* local_token_scores;
 
     // token size in elements
     uint64_t dim;
@@ -128,7 +127,6 @@ public:
         0
       ));
       const uint8_t peer = params.token_owner[local_token_idx];
-      const float score = params.local_token_scores[local_token_idx];
 
       __nv_bfloat16* peer_output = params.routed_outputs_ptrs[peer];
       const uint64_t remote_token_idx = params.local_token_to_remote_token_idx[local_token_idx];
@@ -144,23 +142,18 @@ public:
         );
         if (cute::elem_less(pair_start, mn)) {
           __nv_bfloat162 val {
-            __float2bfloat16(score * accumulators(
+            __float2bfloat16(accumulators(
               cute::make_coord(0, row, col),
               0,
               0
             )),
-            __float2bfloat16(score * accumulators(
+            __float2bfloat16(accumulators(
               cute::make_coord(1, row, col),
               0,
               0
             )),
           };
-          asm(
-            "red.relaxed.sys.add.noftz.bf16x2 [%0], %1;"
-            :
-            : "l"(out_ptr + cute::get<1>(pair_start)), "r"(*reinterpret_cast<unsigned*>(&val))
-            : "memory"
-          );
+          *reinterpret_cast<__nv_bfloat162*>(out_ptr + cute::get<1>(pair_start)) = val;
         }
       }
     }
