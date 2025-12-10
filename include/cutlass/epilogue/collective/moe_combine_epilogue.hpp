@@ -116,10 +116,36 @@ public:
     );
     const cute::Tensor thread_coords = thr_mma.partition_C(tile_coords);
 
-    const uint64_t cur_out_off = params.out_offs[l_coord];
+    const uint64_t tile_row_start = cute::get<0>(blk_shape_MNK) * m_coord;
+    const uint64_t tile_col_start = cute::get<1>(blk_shape_MNK) * n_coord;
+    const uint64_t tile_row_offset = (cute::get<0>(thread_coords(0, 0, 0)) - tile_row_start) / 64 * 64;
+    const uint64_t cur_out_off = params.out_offs[l_coord] + tile_row_start + tile_row_offset;
+
     const int thread_rows = cute::size<1>(cute::layout<0>(accumulators));
     const int thread_cols = cute::size<2>(cute::layout<0>(accumulators));
-    CUTLASS_PRAGMA_UNROLL
+
+    constexpr int kWarpgroupThreads = 128;
+    constexpr int kWarpSize = 32;
+    const int warpId = (threadIdx.x % kWarpgroupThreads) / kWarpSize;
+    #pragma unroll
+    for (int row = warpId; row < 64; row += 4) {
+      const uint64_t local_token_idx = cur_out_off + row;
+      const uint8_t peer = params.token_owner[local_token_idx];
+
+      __nv_bfloat16* peer_output = params.routed_outputs_ptrs[peer];
+      const uint64_t remote_token_idx = params.local_token_to_remote_token_idx[local_token_idx];
+
+      // Assume contiguous row-major layout.
+      auto* out_ptr = (uint4*)(peer_output + remote_token_idx * 4096 + tile_col_start);
+
+      uint4 out_val = {
+        41, 42, 43, 44,
+      };
+      const uint64_t off = threadIdx.x % kWarpSize;
+      *(out_ptr + off) = out_val;
+    }
+
+    /*CUTLASS_PRAGMA_UNROLL
     for (int row = 0; row < thread_rows; ++row) {
       const uint64_t local_token_idx = cur_out_off + cute::get<0>(thread_coords(
         cute::make_coord(0, row, 0),
@@ -156,7 +182,7 @@ public:
           *reinterpret_cast<__nv_bfloat162*>(out_ptr + cute::get<1>(pair_start)) = val;
         }
       }
-    }
+    }*/
   }
 
 private:
