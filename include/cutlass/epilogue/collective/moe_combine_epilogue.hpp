@@ -36,7 +36,12 @@ public:
   using InternalStrideC = InternalCDStride;
   using InternalStrideD = InternalCDStride;
 
-  struct SharedStorage {};
+  static constexpr uint64_t kTileRows = 32; // FIXME: need 64 rows
+  static constexpr uint64_t kTileCols = 256;
+
+  struct SharedStorage {
+    __nv_bfloat16 smem_tile[kTileRows][kTileCols];
+  };
 
   struct Arguments {
     // see the `a2a_kernel()` description of these fields
@@ -98,8 +103,39 @@ public:
       TiledMma tiled_mma,
       ResidueMNK,
       int thread_idx,
-      char*
+      char* smem_buf
   ) {
+    auto& storage = *reinterpret_cast<SharedStorage*>(smem_buf);
+
+    constexpr uint64_t kWarpgroupThreads = 128;
+
+    const int tid = threadIdx.x % kWarpgroupThreads;
+    const int warp = tid / 32;
+    const int lane = tid % 32;
+
+    // Dump registers arranged as https://docs.nvidia.com/cuda/parallel-thread-execution/_images/wgmma-64N16-D.png
+    // to shared memory in row-major order. This definitely has some unwanted bank conflicts.
+    #pragma unroll
+    for (int row = 0; row < 2; ++row) {
+      #pragma unroll
+      for (int col = 0; col < 32; ++col) {
+        const int out_row = warp * 16 + row * 8 + (lane / 4);
+
+        if (out_row >= kTileRows) continue; // FIXME
+
+        const int out_col = 2 * (col * 4 + (tid % 4));
+        storage.smem_tile[out_row][out_col] = __float2bfloat16(accumulators(
+          cute::make_coord(0, row, col),
+          0, 0
+        ));
+        storage.smem_tile[out_row][out_col + 1] = __float2bfloat16(accumulators(
+          cute::make_coord(1, row, col),
+          0, 0
+        ));
+      }
+    }
+    asm volatile("bar.sync 1, 128;");
+
     const auto M = cute::get<0>(problem_shape_mnkl);
     const auto N = cute::get<1>(problem_shape_mnkl);
     const auto m_coord = cute::get<0>(blk_coord_mnkl);
@@ -116,47 +152,34 @@ public:
     );
     const cute::Tensor thread_coords = thr_mma.partition_C(tile_coords);
 
-    const uint64_t cur_out_off = params.out_offs[l_coord];
-    const int thread_rows = cute::size<1>(cute::layout<0>(accumulators));
-    const int thread_cols = cute::size<2>(cute::layout<0>(accumulators));
-    CUTLASS_PRAGMA_UNROLL
-    for (int row = 0; row < thread_rows; ++row) {
-      const uint64_t local_token_idx = cur_out_off + cute::get<0>(thread_coords(
-        cute::make_coord(0, row, 0),
-        0,
-        0
-      ));
+    const uint64_t tile_row_start = cute::get<0>(blk_shape_MNK) * m_coord;
+    const uint64_t tile_col_start = cute::get<1>(blk_shape_MNK) * n_coord;
+    // The M dimension has 2 64-sizes sub-tiles, so we have to add an offset.
+    const uint64_t subtile_row_start = cute::get<0>(
+      thread_coords(
+        cute::make_coord(0, 0, 0),
+        0, 0
+      )
+    );
+    const uint64_t tile_row_offset = (subtile_row_start - tile_row_start) / kTileRows * kTileRows;
+    const uint64_t cur_out_off = params.out_offs[l_coord] + tile_row_start + tile_row_offset;
+
+    #pragma unroll
+    for (int row = warp; row < kTileRows; row += 4) {
+      const auto* vector_row = reinterpret_cast<const uint4*>(storage.smem_tile[row]);
+
+      // FIXME: should make sure the row is in-bounds.
+      const uint64_t local_token_idx = cur_out_off + row;
       const uint8_t peer = params.token_owner[local_token_idx];
 
       __nv_bfloat16* peer_output = params.routed_outputs_ptrs[peer];
       const uint64_t remote_token_idx = params.local_token_to_remote_token_idx[local_token_idx];
-      // Assume contiguous row-major layout.
-      __nv_bfloat16* out_ptr = peer_output + remote_token_idx * params.dim;
 
-      CUTLASS_PRAGMA_UNROLL
-      for (int col = 0; col < thread_cols; ++col) {
-        const auto pair_start = thread_coords(
-          cute::make_coord(0, row, col),
-          0,
-          0
-        );
-        if (cute::elem_less(pair_start, mn)) {
-          __nv_bfloat162 val {
-            __float2bfloat16(accumulators(
-              cute::make_coord(0, row, col),
-              0,
-              0
-            )),
-            __float2bfloat16(accumulators(
-              cute::make_coord(1, row, col),
-              0,
-              0
-            )),
-          };
-          *reinterpret_cast<__nv_bfloat162*>(out_ptr + cute::get<1>(pair_start)) = val;
-        }
-      }
+      // Assume contiguous row-major layout.
+      auto* out_ptr = (uint4*)(peer_output + remote_token_idx * params.dim + tile_col_start);
+      *(out_ptr + lane) = vector_row[lane];
     }
+    asm volatile("bar.sync 1, 128;");
   }
 
 private:
