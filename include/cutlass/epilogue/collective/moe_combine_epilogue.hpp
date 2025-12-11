@@ -47,10 +47,14 @@ public:
   static constexpr uint64_t kConsumerWarpGroups = 2;
   static constexpr uint64_t kTileRows = 64;
   static constexpr uint64_t kTileCols = 256;
+  // The dynamically allocated shared memory limit is 228KB.
+  // We need 64KB for two warpgroups, and the pre-existing data already uses ~192KB.
+  // Thus, we split the rows of each warpgroup into halves.
+  static constexpr uint64_t kRowSplit = 2;
 
   struct SharedStorage {
     // FIXME: need full rows
-    __nv_bfloat16 smem_tiles[kConsumerWarpGroups][kTileRows/2][kTileCols];
+    __nv_bfloat16 smem_tiles[kConsumerWarpGroups][kTileRows / kRowSplit][kTileCols];
   };
 
   struct Arguments {
@@ -96,6 +100,70 @@ public:
     : params(params)
   {}
 
+  template <
+    typename FrgEngine,
+    typename FrgLayout
+  >
+  CUTLASS_DEVICE void dump_registers_via_smem(
+    SharedStorage& smem_buf,
+    const cute::Tensor<FrgEngine, FrgLayout>& accumulators,
+    int start_row,
+    int end_row,
+    uint64_t cur_out_off,
+    uint64_t tile_col_start
+  ) {
+    // Warpgroup 0 is producer warps, warpgroups 1 and 2 are the consumers, so we have to subtract one.
+    const int warpgroup_idx = threadIdx.x / kWarpgroupThreads - 1;
+    const int tid = threadIdx.x % kWarpgroupThreads;
+    const int warp = tid / 32;
+    const int lane = tid % 32;
+
+    auto& smem_tile = smem_buf.smem_tiles[warpgroup_idx];
+
+    // Dump registers arranged as https://docs.nvidia.com/cuda/parallel-thread-execution/_images/wgmma-64N16-D.png
+    // to shared memory in row-major order. This definitely has some bank conflicts, but since
+    // we are bottlenecked by NVLink anyway, this is okay.
+    #pragma unroll
+    for (int row = 0; row < 2; ++row) {
+      #pragma unroll
+      for (int col = 0; col < kTileCols / (4 * 2); ++col) { // we own every 4th pair of elements
+        int out_row = warp * 16 + row * 8 + (lane / 4);
+        if (out_row < start_row || out_row >= end_row) {
+          continue;
+        }
+        out_row -= start_row;
+        const int out_col = 2 * (col * 4 + tid % 4);
+
+        smem_tile[out_row][out_col] = __float2bfloat16(accumulators(
+          cute::make_coord(0, row, col),
+          0, 0
+        ));
+        smem_tile[out_row][out_col + 1] = __float2bfloat16(accumulators(
+          cute::make_coord(1, row, col),
+          0, 0
+        ));
+      }
+    }
+    sync_warpgroup(warpgroup_idx);
+
+    #pragma unroll
+    for (int row = start_row + warp; row < end_row; row += 4) {
+      const auto* vector_row = reinterpret_cast<const uint4*>(smem_tile[row - start_row]);
+
+      // FIXME: should make sure the row is in-bounds.
+      const uint64_t local_token_idx = cur_out_off + row;
+      const uint8_t peer = params.token_owner[local_token_idx];
+
+      __nv_bfloat16* peer_output = params.routed_outputs_ptrs[peer];
+      const uint64_t remote_token_idx = params.local_token_to_remote_token_idx[local_token_idx];
+
+      // Assume contiguous row-major layout.
+      auto* out_ptr = (uint4*)(peer_output + remote_token_idx * params.dim + tile_col_start);
+      *(out_ptr + lane) = vector_row[lane];
+    }
+    sync_warpgroup(warpgroup_idx);
+  }
+
   template<
     class ProblemShapeMNKL,
     class BlockShapeMNK,
@@ -115,38 +183,6 @@ public:
       int thread_idx,
       char* smem_buf
   ) {
-    // Warpgroup 0 is producer warps, warpgroups 1 and 2 are the consumers, so we have to subtract one.
-    const int warpgroup_idx = threadIdx.x / kWarpgroupThreads - 1;
-    const int tid = threadIdx.x % kWarpgroupThreads;
-    const int warp = tid / 32;
-    const int lane = tid % 32;
-
-    auto& smem_tile = reinterpret_cast<SharedStorage*>(smem_buf)->smem_tiles[warpgroup_idx];
-
-    // Dump registers arranged as https://docs.nvidia.com/cuda/parallel-thread-execution/_images/wgmma-64N16-D.png
-    // to shared memory in row-major order. This definitely has some unwanted bank conflicts.
-    #pragma unroll
-    for (int row = 0; row < 2; ++row) {
-      #pragma unroll
-      for (int col = 0; col < kTileCols / (4 * 2); ++col) { // we own every 4th pair of elements
-        const int out_row = warp * 16 + row * 8 + (lane / 4);
-
-        if (out_row >= kTileRows/2) continue; // FIXME
-
-        const int out_col = 2 * (col * 4 + tid % 4);
-
-        smem_tile[out_row][out_col] = __float2bfloat16(accumulators(
-          cute::make_coord(0, row, col),
-          0, 0
-        ));
-        smem_tile[out_row][out_col + 1] = __float2bfloat16(accumulators(
-          cute::make_coord(1, row, col),
-          0, 0
-        ));
-      }
-    }
-    sync_warpgroup(warpgroup_idx);
-
     const auto M = cute::get<0>(problem_shape_mnkl);
     const auto N = cute::get<1>(problem_shape_mnkl);
     const auto m_coord = cute::get<0>(blk_coord_mnkl);
@@ -176,21 +212,16 @@ public:
     const uint64_t cur_out_off = params.out_offs[l_coord] + tile_row_start + tile_row_offset;
 
     #pragma unroll
-    for (int row = warp; row < kTileRows/2; row += 4) {
-      const auto* vector_row = reinterpret_cast<const uint4*>(smem_tile[row]);
-
-      // FIXME: should make sure the row is in-bounds.
-      const uint64_t local_token_idx = cur_out_off + row;
-      const uint8_t peer = params.token_owner[local_token_idx];
-
-      __nv_bfloat16* peer_output = params.routed_outputs_ptrs[peer];
-      const uint64_t remote_token_idx = params.local_token_to_remote_token_idx[local_token_idx];
-
-      // Assume contiguous row-major layout.
-      auto* out_ptr = (uint4*)(peer_output + remote_token_idx * params.dim + tile_col_start);
-      *(out_ptr + lane) = vector_row[lane];
+    for (int rows_part = 0; rows_part < kRowSplit; ++rows_part) {
+      dump_registers_via_smem(
+        *reinterpret_cast<SharedStorage*>(smem_buf),
+        accumulators,
+        rows_part * (kTileRows / kRowSplit),
+        (rows_part + 1) * (kTileRows / kRowSplit),
+        cur_out_off,
+        tile_col_start
+      );
     }
-    sync_warpgroup(warpgroup_idx);
   }
 
 private:
