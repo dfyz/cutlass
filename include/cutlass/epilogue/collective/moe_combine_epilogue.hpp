@@ -10,6 +10,14 @@
 
 #include <cuda/atomic>
 
+namespace {
+  constexpr uint64_t kWarpgroupThreads = 128;
+
+  CUTLASS_DEVICE void sync_warpgroup(int warpgroup_idx) {
+    cutlass::arch::NamedBarrier::sync(kWarpgroupThreads, 13 + warpgroup_idx);
+  }
+}
+
 namespace cutlass::epilogue::collective {
 
 template <
@@ -36,11 +44,12 @@ public:
   using InternalStrideC = InternalCDStride;
   using InternalStrideD = InternalCDStride;
 
+  static constexpr uint64_t kConsumerWarpGroups = 2;
   static constexpr uint64_t kTileRows = 32; // FIXME: need 64 rows
   static constexpr uint64_t kTileCols = 256;
 
   struct SharedStorage {
-    __nv_bfloat16 smem_tile[kTileRows][kTileCols];
+    __nv_bfloat16 smem_tiles[kConsumerWarpGroups][kTileRows][kTileCols];
   };
 
   struct Arguments {
@@ -105,36 +114,44 @@ public:
       int thread_idx,
       char* smem_buf
   ) {
-    auto& storage = *reinterpret_cast<SharedStorage*>(smem_buf);
-
-    constexpr uint64_t kWarpgroupThreads = 128;
-
+    // Warpgroup 0 is producer warps, warpgroups 1 and 2 are the consumers, so we have to subtract one.
+    const int warpgroup_idx = threadIdx.x / kWarpgroupThreads - 1;
     const int tid = threadIdx.x % kWarpgroupThreads;
     const int warp = tid / 32;
     const int lane = tid % 32;
+
+
+    auto& smem_tile = reinterpret_cast<SharedStorage*>(smem_buf)->smem_tiles[warpgroup_idx];
 
     // Dump registers arranged as https://docs.nvidia.com/cuda/parallel-thread-execution/_images/wgmma-64N16-D.png
     // to shared memory in row-major order. This definitely has some unwanted bank conflicts.
     #pragma unroll
     for (int row = 0; row < 2; ++row) {
       #pragma unroll
-      for (int col = 0; col < 32; ++col) {
+      for (int col = 0; col < kTileCols / (4 * 2); ++col) { // we own every 4th pair of elements
         const int out_row = warp * 16 + row * 8 + (lane / 4);
 
         if (out_row >= kTileRows) continue; // FIXME
 
-        const int out_col = 2 * (col * 4 + (tid % 4));
-        storage.smem_tile[out_row][out_col] = __float2bfloat16(accumulators(
+        const int out_col = 2 * (col * 4 + tid % 4);
+
+        // printf(
+        //   "threadIdx.x = %d, row = %d, col = %d, out_row = %d, out_col = %d\n",
+        //   threadIdx.x,
+        //   row, col, out_row, out_col
+        // );
+
+        smem_tile[out_row][out_col] = __float2bfloat16(accumulators(
           cute::make_coord(0, row, col),
           0, 0
         ));
-        storage.smem_tile[out_row][out_col + 1] = __float2bfloat16(accumulators(
+        smem_tile[out_row][out_col + 1] = __float2bfloat16(accumulators(
           cute::make_coord(1, row, col),
           0, 0
         ));
       }
     }
-    asm volatile("bar.sync 1, 128;");
+    sync_warpgroup(warpgroup_idx);
 
     const auto M = cute::get<0>(problem_shape_mnkl);
     const auto N = cute::get<1>(problem_shape_mnkl);
@@ -166,7 +183,7 @@ public:
 
     #pragma unroll
     for (int row = warp; row < kTileRows; row += 4) {
-      const auto* vector_row = reinterpret_cast<const uint4*>(storage.smem_tile[row]);
+      const auto* vector_row = reinterpret_cast<const uint4*>(smem_tile[row]);
 
       // FIXME: should make sure the row is in-bounds.
       const uint64_t local_token_idx = cur_out_off + row;
@@ -179,7 +196,7 @@ public:
       auto* out_ptr = (uint4*)(peer_output + remote_token_idx * params.dim + tile_col_start);
       *(out_ptr + lane) = vector_row[lane];
     }
-    asm volatile("bar.sync 1, 128;");
+    sync_warpgroup(warpgroup_idx);
   }
 
 private:

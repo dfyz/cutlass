@@ -279,7 +279,8 @@ public:
   using StorePipelineState = cutlass::PipelineState<0>;
 
   using TensorStorage = typename EpilogueOp::SharedStorage;
-  using TensorMapStorage = typename EpilogueOp::SharedStorage;
+  // using TensorMapStorage = typename EpilogueOp::SharedStorage;
+  struct TensorMapStorage{};
   using PipelineStorage = typename LoadPipeline::SharedStorage;
 
   template<class CtaTileMNK>
