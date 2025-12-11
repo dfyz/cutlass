@@ -45,11 +45,12 @@ public:
   using InternalStrideD = InternalCDStride;
 
   static constexpr uint64_t kConsumerWarpGroups = 2;
-  static constexpr uint64_t kTileRows = 32; // FIXME: need 64 rows
+  static constexpr uint64_t kTileRows = 64;
   static constexpr uint64_t kTileCols = 256;
 
   struct SharedStorage {
-    __nv_bfloat16 smem_tiles[kConsumerWarpGroups][kTileRows][kTileCols];
+    // FIXME: need full rows
+    __nv_bfloat16 smem_tiles[kConsumerWarpGroups][kTileRows/2][kTileCols];
   };
 
   struct Arguments {
@@ -130,15 +131,9 @@ public:
       for (int col = 0; col < kTileCols / (4 * 2); ++col) { // we own every 4th pair of elements
         const int out_row = warp * 16 + row * 8 + (lane / 4);
 
-        if (out_row >= kTileRows) continue; // FIXME
+        if (out_row >= kTileRows/2) continue; // FIXME
 
         const int out_col = 2 * (col * 4 + tid % 4);
-
-        // printf(
-        //   "threadIdx.x = %d, row = %d, col = %d, out_row = %d, out_col = %d\n",
-        //   threadIdx.x,
-        //   row, col, out_row, out_col
-        // );
 
         smem_tile[out_row][out_col] = __float2bfloat16(accumulators(
           cute::make_coord(0, row, col),
@@ -181,7 +176,7 @@ public:
     const uint64_t cur_out_off = params.out_offs[l_coord] + tile_row_start + tile_row_offset;
 
     #pragma unroll
-    for (int row = warp; row < kTileRows; row += 4) {
+    for (int row = warp; row < kTileRows/2; row += 4) {
       const auto* vector_row = reinterpret_cast<const uint4*>(smem_tile[row]);
 
       // FIXME: should make sure the row is in-bounds.
