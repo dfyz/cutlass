@@ -120,7 +120,6 @@ public:
     const int warp = tid / 32;
     const int lane = tid % 32;
 
-
     auto& smem_tile = reinterpret_cast<SharedStorage*>(smem_buf)->smem_tiles[warpgroup_idx];
 
     // Dump registers arranged as https://docs.nvidia.com/cuda/parallel-thread-execution/_images/wgmma-64N16-D.png
@@ -169,8 +168,8 @@ public:
     );
     const cute::Tensor thread_coords = thr_mma.partition_C(tile_coords);
 
-    const uint64_t tile_row_start = cute::get<0>(blk_shape_MNK) * m_coord;
-    const uint64_t tile_col_start = cute::get<1>(blk_shape_MNK) * n_coord;
+    const uint64_t tile_row_start = cute::get<0>(tile_coords(0, 0));
+    const uint64_t tile_col_start = cute::get<1>(tile_coords(0, 0));
     // The M dimension has 2 64-sizes sub-tiles, so we have to add an offset.
     const uint64_t subtile_row_start = cute::get<0>(
       thread_coords(
