@@ -9,6 +9,7 @@
 #include <cutlass/epilogue/thread/linear_combination.h> // LinearCombination
 
 #include <cuda/atomic>
+#include <limits>
 
 namespace {
   constexpr uint64_t kWarpgroupThreads = 128;
@@ -153,6 +154,11 @@ public:
       // FIXME: should make sure the row is in-bounds.
       const uint64_t local_token_idx = cur_out_off + row;
       const uint8_t peer = params.token_owner[local_token_idx];
+
+      if (peer == std::numeric_limits<uint8_t>::max()) {
+        // This is a padding token, ignore it.
+        continue;
+      }
 
       __nv_bfloat16* peer_output = params.routed_outputs_ptrs[peer];
       const uint64_t remote_token_idx = params.local_token_to_remote_token_idx[local_token_idx];
