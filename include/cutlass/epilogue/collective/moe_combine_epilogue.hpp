@@ -64,6 +64,10 @@ public:
     uint8_t* token_owner;
     uint64_t* local_token_to_remote_token_idx;
 
+    // `chunk_size_per_expert[e]` is the total amount of tokens
+    // we need to process for GEMM group `e`
+    uint64_t* chunk_size_per_expert;
+
     // token size in elements
     uint64_t dim;
 
@@ -108,16 +112,18 @@ public:
   CUTLASS_DEVICE void dump_registers_via_smem(
     SharedStorage& smem_buf,
     const cute::Tensor<FrgEngine, FrgLayout>& accumulators,
-    int start_row,
-    int end_row,
+    uint64_t start_row,
+    uint64_t end_row,
     uint64_t cur_out_off,
-    uint64_t tile_col_start
+    uint64_t tile_row_start,
+    uint64_t tile_col_start,
+    uint64_t local_token_count
   ) {
     // Warpgroup 0 is producer warps, warpgroups 1 and 2 are the consumers, so we have to subtract one.
-    const int warpgroup_idx = threadIdx.x / kWarpgroupThreads - 1;
-    const int tid = threadIdx.x % kWarpgroupThreads;
-    const int warp = tid / 32;
-    const int lane = tid % 32;
+    const uint64_t warpgroup_idx = threadIdx.x / kWarpgroupThreads - 1;
+    const uint64_t tid = threadIdx.x % kWarpgroupThreads;
+    const uint64_t warp = tid / 32;
+    const uint64_t lane = tid % 32;
 
     auto& smem_tile = smem_buf.smem_tiles[warpgroup_idx];
 
@@ -125,15 +131,15 @@ public:
     // to shared memory in row-major order. This definitely has some bank conflicts, but since
     // we are bottlenecked by NVLink anyway, this is okay.
     #pragma unroll
-    for (int row = 0; row < 2; ++row) {
+    for (uint64_t row = 0; row < 2; ++row) {
       #pragma unroll
-      for (int col = 0; col < kTileCols / (4 * 2); ++col) { // we own every 4th pair of elements
-        int out_row = warp * 16 + row * 8 + (lane / 4);
+      for (uint64_t col = 0; col < kTileCols / (4 * 2); ++col) { // we own every 4th pair of elements
+        uint64_t out_row = warp * 16 + row * 8 + (lane / 4);
         if (out_row < start_row || out_row >= end_row) {
           continue;
         }
         out_row -= start_row;
-        const int out_col = 2 * (col * 4 + tid % 4);
+        const uint64_t out_col = 2 * (col * 4 + tid % 4);
 
         smem_tile[out_row][out_col] = __float2bfloat16(accumulators(
           cute::make_coord(0, row, col),
@@ -148,17 +154,16 @@ public:
     sync_warpgroup(warpgroup_idx);
 
     #pragma unroll
-    for (int row = start_row + warp; row < end_row; row += 4) {
+    for (uint64_t row = start_row + warp; row < end_row; row += 4) {
       const auto* vector_row = reinterpret_cast<const uint4*>(smem_tile[row - start_row]);
 
-      // FIXME: should make sure the row is in-bounds.
-      const uint64_t local_token_idx = cur_out_off + row;
-      const uint8_t peer = params.token_owner[local_token_idx];
-
-      if (peer == std::numeric_limits<uint8_t>::max()) {
-        // This is a padding token, ignore it.
+      if (tile_row_start + row >= local_token_count) {
+        // Skip a padding token.
         continue;
       }
+
+      const uint64_t local_token_idx = cur_out_off + tile_row_start + row;
+      const uint8_t peer = params.token_owner[local_token_idx];
 
       __nv_bfloat16* peer_output = params.routed_outputs_ptrs[peer];
       const uint64_t remote_token_idx = params.local_token_to_remote_token_idx[local_token_idx];
@@ -195,6 +200,8 @@ public:
     const auto n_coord = cute::get<1>(blk_coord_mnkl);
     const auto l_coord = cute::get<3>(blk_coord_mnkl);
 
+    const uint64_t local_token_count = params.chunk_size_per_expert[l_coord];
+
     const auto thr_mma = tiled_mma.get_thread_slice(thread_idx);
     const auto mn = cute::make_shape(M, N);
     const cute::Tensor global_coords = cute::make_identity_tensor(mn);
@@ -205,8 +212,7 @@ public:
     );
     const cute::Tensor thread_coords = thr_mma.partition_C(tile_coords);
 
-    const uint64_t tile_row_start = cute::get<0>(tile_coords(0, 0));
-    const uint64_t tile_col_start = cute::get<1>(tile_coords(0, 0));
+    uint64_t tile_row_start = cute::get<0>(tile_coords(0, 0));
     // The M dimension has 2 64-sizes sub-tiles, so we have to add an offset.
     const uint64_t subtile_row_start = cute::get<0>(
       thread_coords(
@@ -215,17 +221,25 @@ public:
       )
     );
     const uint64_t tile_row_offset = (subtile_row_start - tile_row_start) / kTileRows * kTileRows;
-    const uint64_t cur_out_off = params.out_offs[l_coord] + tile_row_start + tile_row_offset;
+    tile_row_start += tile_row_offset;
+
+    const uint64_t tile_col_start = cute::get<1>(tile_coords(0, 0));
+    const uint64_t cur_out_off = params.out_offs[l_coord];
+    const uint64_t rows_per_part = kTileRows / kRowSplit;
 
     #pragma unroll
-    for (int rows_part = 0; rows_part < kRowSplit; ++rows_part) {
+    for (uint64_t part = 0; part < kRowSplit; ++part) {
+      const uint64_t start_row = part * rows_per_part;
+      const uint64_t end_row = start_row + rows_per_part;
       dump_registers_via_smem(
         *reinterpret_cast<SharedStorage*>(smem_buf),
         accumulators,
-        rows_part * (kTileRows / kRowSplit),
-        (rows_part + 1) * (kTileRows / kRowSplit),
+        start_row,
+        end_row,
         cur_out_off,
-        tile_col_start
+        tile_row_start,
+        tile_col_start,
+        local_token_count
       );
     }
   }
