@@ -23,14 +23,14 @@ public:
     // this acquire is paired with the release in the token dispatcher
     uint32_t spins = 0;
     auto* counter = Base::scheduler_params.problem_shapes_.group_counters + idx;
-    while (__nv_atomic_load_n(counter, __NV_ATOMIC_ACQUIRE) != 0) {
+    while (__nv_atomic_load_n(counter, __NV_ATOMIC_ACQUIRE, __NV_THREAD_SCOPE_SYSTEM) != 0) {
       __nanosleep(16); // sleep for a couple of cycles; constant taken out of thin air
       ++spins;
       if (spins > 100'000'000) {
         printf(
           "Timedout when waiting for the counter for group %d to become zero: its value is still %u\n",
           idx,
-          __nv_atomic_load_n(counter, __NV_ATOMIC_RELAXED)
+          __nv_atomic_load_n(counter, __NV_ATOMIC_RELAXED, __NV_THREAD_SCOPE_SYSTEM)
         );
         __trap();
       }
