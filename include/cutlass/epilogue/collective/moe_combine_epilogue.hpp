@@ -60,13 +60,13 @@ public:
 
   struct Arguments {
     // see the `a2a_kernel()` description of these fields
-    uint64_t* out_offs;
-    uint8_t* token_owner;
-    uint64_t* local_token_to_remote_token_idx;
+    const uint64_t* out_offs;
+    const uint8_t* token_owner;
+    const uint64_t* local_token_to_remote_token_idx;
 
     // `chunk_size_per_expert[e]` is the total amount of tokens
     // we need to process for GEMM group `e`
-    uint64_t* chunk_size_per_expert;
+    const uint64_t* chunk_size_per_expert;
 
     // token size in elements
     uint64_t dim;
